@@ -37,18 +37,31 @@ _ready = threading.Event()
 _load_error: str | None = None
 
 
+_vad = None
+
+
 def _load() -> None:
-    """모델을 올린다. 이미지에 미리 받아뒀으므로 내려받기는 없다."""
-    global _model, _load_error
+    """모델 둘을 올린다. 이미지에 미리 받아뒀으므로 내려받기는 없다.
+
+    VAD 를 AutoModel 에 얹지 않고 따로 두는 이유가 있다. FunASR 에 VAD 를
+    맡기고 sentence_timestamp=True 로 구간을 받으려면 구두점 모델이 반드시
+    있어야 하는데(없으면 punc_res 미할당으로 터진다), 그 구두점 모델은
+    중국어·영어용이다. 한국어 문장 경계를 못 잡으면 구간이 통째로 뭉쳐서
+    타임스탬프가 쓸모없어진다.
+
+    그래서 VAD 를 직접 돌려 말소리 구간을 얻고, 구간마다 인식을 돌린다.
+    언어에 기대지 않고, 구간별로 감정·음향 태그가 따로 나온다는 이점도 있다.
+    """
+    global _model, _vad, _load_error
     try:
         from funasr import AutoModel
-        _model = AutoModel(
-            model=MODEL_DIR,
-            vad_model=VAD_MODEL,
+        _vad = AutoModel(
+            model=VAD_MODEL,
             vad_kwargs={"max_single_segment_time": MAX_SEGMENT_MS},
             device=DEVICE,
             disable_update=True,
         )
+        _model = AutoModel(model=MODEL_DIR, device=DEVICE, disable_update=True)
         _ready.set()
     except Exception as e:  # noqa: BLE001
         _load_error = f"{type(e).__name__}: {e}"
@@ -98,6 +111,45 @@ def split_tags(raw: str) -> tuple[str, str, list[str]]:
     return TAG_RE.sub("", raw or "").strip(), emo, events
 
 
+def _run(path: str, language: str) -> list[dict]:
+    """VAD 로 말소리 구간을 찾고, 구간마다 인식을 돌린다.
+
+    구간을 자를 때 파일을 다시 읽지 않고 메모리의 파형을 잘라 넘긴다.
+    서버가 이미 16kHz 모노로 만들어 보내므로 변환도 필요 없다.
+    """
+    import soundfile as sf
+
+    audio, sr = sf.read(path, dtype="float32", always_2d=False)
+    if getattr(audio, "ndim", 1) > 1:
+        audio = audio.mean(axis=1)
+
+    vad = _vad.generate(input=path)
+    spans = (vad[0].get("value") if vad else None) or []
+
+    out: list[dict] = []
+    for span in spans:
+        try:
+            s_ms, e_ms = float(span[0]), float(span[1])
+        except (TypeError, IndexError, ValueError):
+            continue
+        lo, hi = int(s_ms * sr / 1000), int(e_ms * sr / 1000)
+        piece = audio[max(0, lo):min(len(audio), hi)]
+        if len(piece) < int(sr * 0.1):     # 0.1초 미만은 인식할 게 없다
+            continue
+        try:
+            r = _model.generate(input=piece, fs=sr, cache={},
+                                language=language or "auto", use_itn=True)
+        except Exception:  # noqa: BLE001
+            # 한 구간이 실패해도 나머지는 살린다. 전체를 버리는 게 더 나쁘다.
+            continue
+        text, emo, events = split_tags((r[0] or {}).get("text", "") if r else "")
+        if not text and not events:
+            continue
+        out.append({"start": s_ms / 1000.0, "end": e_ms / 1000.0,
+                    "text": text, "emotion": emo, "events": events})
+    return out
+
+
 @app.post("/transcribe")
 async def transcribe(file: UploadFile = File(...), language: str = "ko"):
     if _load_error:
@@ -110,15 +162,9 @@ async def transcribe(file: UploadFile = File(...), language: str = "ko"):
         while chunk := await file.read(4 * 1024 * 1024):
             tmp.write(chunk)
         tmp.close()
-
-        res = _model.generate(
-            input=tmp.name,
-            language=language or "auto",
-            use_itn=True,              # 숫자·단위를 읽는 대로가 아니라 표기대로
-            batch_size_s=300,
-            merge_vad=False,           # VAD 구간을 합치면 시각 해상도를 잃는다
-            sentence_timestamp=True,   # 구간별 시작·끝을 받는다
-        )
+        segments = _run(tmp.name, language)
+    except HTTPException:
+        raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"인식 실패: {type(e).__name__}: {e}") from e
     finally:
@@ -131,26 +177,4 @@ async def transcribe(file: UploadFile = File(...), language: str = "ko"):
         except OSError:
             pass
 
-    out = []
-    for item in res or []:
-        # sentence_timestamp=True 면 구간이 sentence_info 에 들어온다.
-        # 혹시 없으면 전체를 한 덩어리로라도 돌려준다.
-        sents = item.get("sentence_info")
-        if not sents:
-            text, emo, events = split_tags(item.get("text", ""))
-            if text or events:
-                out.append({"start": 0.0, "end": 0.0, "text": text,
-                            "emotion": emo, "events": events})
-            continue
-        for s in sents:
-            text, emo, events = split_tags(s.get("text", ""))
-            if not text and not events:
-                continue
-            out.append({
-                "start": float(s.get("start", 0)) / 1000.0,
-                "end": float(s.get("end", 0)) / 1000.0,
-                "text": text,
-                "emotion": emo,
-                "events": events,
-            })
-    return {"segments": out}
+    return {"segments": segments}
